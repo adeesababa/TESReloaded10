@@ -230,9 +230,20 @@ float4 ScreenSpaceShadow(VSOUT IN) : COLOR0
 
 	float3 pos = reconstructPosition(uv);// + expand(random3); 
 
-	float bias = 0.01;
 	if (pos.z > SSS_MAXDEPTH) return float4(1.0, color.g, 0, 1); // early out for pixels further away than the max render distance
-	
+
+	// Surfaces facing away from the sun receive no direct sun, so a contact shadow there can
+	// only darken ambient light -- and it is exactly where the march runs INTO the receiving
+	// surface. Bilinear linear-depth reads along that ray are slightly off the true plane, and
+	// the error cycles with the sub-pixel sample phase, so a fixed tiny bias flips the test on
+	// and off in bands perpendicular to the ray (horizontal lines under a high sun). Fade the
+	// term out as the surface turns away from the light, and scale the self-intersection bias
+	// with distance so grazing lit faces do not band either.
+	float NdotL = dot(GetNormal(uv), normalize(TESR_ViewSpaceLightDir.xyz));
+	float facing = saturate(NdotL * 8.0f);
+	if (facing <= 0.0f) return float4(1.0, color.g, 0, 1);
+	float bias = max(0.01f, pos.z * 0.002f);
+
     float3 random3 = random(uv);
     float rand = lerp(min(0.8f, pos.z / SSS_MAXDEPTH), 1.0f, random3.r); // some noise to vary the ray length
 
@@ -268,7 +279,7 @@ float4 ScreenSpaceShadow(VSOUT IN) : COLOR0
 		total += 1/step1 + 1/step2; // weight samples inversely with distance
 	}
 
-    occlusion = pows(occlusion / total, 0.3); // get an average shading based on total weights
+    occlusion = pows(occlusion / total, 0.3) * facing; // get an average shading based on total weights
 	
 
     // save result of SSS in red channel, and fade contribution with distance
@@ -329,12 +340,12 @@ technique {
 
 	pass {
 		VertexShader = compile vs_3_0 FrameVS();
-	 	PixelShader = compile ps_3_0 DepthBlur(TESR_PointShadowBuffer, OffsetMaskH, TESR_ShadowScreenSpaceData.y, 3500, SSS_MAXDEPTH);
+	 	PixelShader = compile ps_3_0 DepthBlurKeep(TESR_PointShadowBuffer, OffsetMaskH, TESR_ShadowScreenSpaceData.y, 3500, SSS_MAXDEPTH);
 	}
 
 	pass {
 		VertexShader = compile vs_3_0 FrameVS();
-	 	PixelShader = compile ps_3_0 DepthBlur(TESR_PointShadowBuffer, OffsetMaskV, TESR_ShadowScreenSpaceData.y, 3500, SSS_MAXDEPTH);
+	 	PixelShader = compile ps_3_0 DepthBlurKeep(TESR_PointShadowBuffer, OffsetMaskV, TESR_ShadowScreenSpaceData.y, 3500, SSS_MAXDEPTH);
 	}
 
     pass {
