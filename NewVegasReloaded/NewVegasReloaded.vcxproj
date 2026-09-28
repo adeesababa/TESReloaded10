@@ -235,6 +235,7 @@
     <ClInclude Include="..\src\core\SettingManager.h" />
     <ClInclude Include="..\src\core\ShaderCollection.h" />
     <ClInclude Include="..\src\core\ShaderManager.h" />
+    <ClInclude Include="..\src\core\GpuProfiler.h" />
     <ClInclude Include="..\src\core\ShaderRecord.h" />
     <ClInclude Include="..\src\core\ShadowManager.h" />
     <ClInclude Include="..\src\core\TextureManager.h" />

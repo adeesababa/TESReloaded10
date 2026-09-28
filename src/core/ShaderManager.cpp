@@ -1,3 +1,4 @@
+#include "GpuProfiler.h"
 #define RESZ_CODE 0x7FA05000
 
 /**
@@ -772,25 +773,54 @@ void ShaderManager::RenderEffectsPreTonemapping(IDirect3DSurface9* RenderTarget)
 	if (GameState.OverlayIsOn && TESMain::IsMenuBackgroundReady()) return; // disable all effects during terminal/lockpicking sequences
 
 	auto timer = TimeLogger();
+	static CpuTimer preTonemapCpuTimer("Pre-tonemap chain (CPU)");
+	CpuProfileScope preTonemapCpu(preTonemapCpuTimer);
 
 	IDirect3DDevice9* Device = TheRenderManager->device;
 	IDirect3DSurface9* SourceSurface = TheTextureManager->SourceSurface;
 	IDirect3DSurface9* RenderedSurface = TheTextureManager->RenderedSurface;
+	// F10 profiler buckets (GpuProfiler.h). Inactive, and free, unless profiling is switched on.
+	static GpuTimer depthTimer("Depth combine");
+	static GpuTimer normalsTimer("Normal reconstruction");
+	static GpuTimer pointShadowTimer("Point shadow lighting");
+	static GpuTimer sunContactTimer("Sun contact shadows");
+	static GpuTimer copyTimer("Pre-tonemap copies");
+	static GpuTimer shadowApplyTimer("Shadow apply");
+	static GpuTimer snowAccumulationTimer("Snow accumulation");
+	static GpuTimer aoTimer("Ambient occlusion");
+	static GpuTimer materialEffectsTimer("Wet + flashlight + specular");
+	static GpuTimer underwaterTimer("Underwater");
+	static GpuTimer fogTimer("Volumetric fog");
+	static GpuTimer godRaysTimer("God rays");
+	static GpuTimer hdrTimer("Luma + exposure + bloom");
+	static GpuTimer preColorTimer("Pre-tonemap lens + LUT");
 
 	// prepare device for effects
 	Device->SetStreamSource(0, FrameVertex, 0, sizeof(FrameVS));
 	Device->SetFVF(FrameFVF);
 
 	// render post process normals for use by shaders
-	RenderEffectToRT(Effects.CombineDepth->Textures.CombinedDepthSurface, Effects.CombineDepth, false);
-	RenderEffectToRT(Effects.Normals->Textures.NormalsSurface, Effects.Normals, false);
+	{
+		GpuProfileScope gpu(depthTimer, Device);
+		RenderEffectToRT(Effects.CombineDepth->Textures.CombinedDepthSurface, Effects.CombineDepth, false);
+	}
+	{
+		GpuProfileScope gpu(normalsTimer, Device);
+		RenderEffectToRT(Effects.Normals->Textures.NormalsSurface, Effects.Normals, false);
+	}
 
 	// render a shadow pass for point lights
 	if ((GameState.isExterior && Effects.ShadowsExteriors->Enabled) || (!GameState.isExterior && Effects.ShadowsInteriors->Enabled)) {
-		// separate lights in 2 batches
-		RenderEffectToRT(Effects.ShadowsExteriors->Textures.ShadowPassSurface, Effects.PointShadows, true);
-		if (Effects.ShadowsExteriors->Settings.Interiors.LightPoints > 6) RenderEffectToRT(Effects.ShadowsExteriors->Textures.ShadowPassSurface, Effects.PointShadows2, false);
-		if (GameState.isExterior) RenderEffectToRT(Effects.ShadowsExteriors->Textures.ShadowPassSurface, Effects.SunShadows, false);
+		{
+			GpuProfileScope gpu(pointShadowTimer, Device);
+			// separate lights in 2 batches
+			RenderEffectToRT(Effects.ShadowsExteriors->Textures.ShadowPassSurface, Effects.PointShadows, true);
+			if (Effects.ShadowsExteriors->Settings.Interiors.LightPoints > 6) RenderEffectToRT(Effects.ShadowsExteriors->Textures.ShadowPassSurface, Effects.PointShadows2, false);
+		}
+		if (GameState.isExterior) {
+			GpuProfileScope gpu(sunContactTimer, Device);
+			RenderEffectToRT(Effects.ShadowsExteriors->Textures.ShadowPassSurface, Effects.SunShadows, false);
+		}
 	}
 	else {
 		// Nothing above ran this frame, so ShadowPassSurface keeps whatever it last
@@ -806,42 +836,72 @@ void ShaderManager::RenderEffectsPreTonemapping(IDirect3DSurface9* RenderTarget)
 	Device->SetRenderTarget(0, RenderTarget);
 
 	// copy the source render target to both the rendered and source textures (rendered gets updated after every pass, source once per effect)
-	Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_NONE);
-	Device->StretchRect(RenderTarget, NULL, SourceSurface, NULL, D3DTEXF_NONE);
-
-	if (GameState.isExterior) 
-		Effects.ShadowsExteriors->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	else 
-		Effects.ShadowsInteriors->Render(Device, RenderTarget, RenderedSurface, 0, true, SourceSurface);
-
-	Effects.SnowAccumulation->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.AmbientOcclusion->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.WetWorld->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	// Beam march first, into its own half res buffer, so the Flashlight Combine pass can
-	// read it. Control.x already folds the effect toggle, the per view toggle and the
-	// strength together, so this one test gates the whole thing.
-	if (Effects.FlashlightBeam->Constants.Control.x > 0.0f) {
-		RenderEffectToRT(Effects.FlashlightBeam->Textures.VolumetricSurface, Effects.FlashlightBeam, true);
-		Device->SetRenderTarget(0, RenderTarget);
-	}
-	Effects.Flashlight->Render(Device, RenderTarget, RenderedSurface, Effects.Flashlight->selectedPass, true, SourceSurface);
-	Effects.Specular->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.Underwater->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.VolumetricFog->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.GodRays->Render(Device, RenderTarget, RenderedSurface, 0, true, SourceSurface);
-
-	// calculate average luma for use by shaders
-	if (avglumaRequired) {
-		RenderEffectToRT(Effects.AvgLuma->Textures.AvgLumaSurface, Effects.AvgLuma, NULL);
-		Device->SetRenderTarget(0, RenderTarget); 	// restore device used for effects
+	{
+		GpuProfileScope gpu(copyTimer, Device);
+		Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_NONE);
+		Device->StretchRect(RenderTarget, NULL, SourceSurface, NULL, D3DTEXF_NONE);
 	}
 
-	Effects.Exposure->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.Bloom->RenderBloomBuffer(RenderTarget);
+	{
+		GpuProfileScope gpu(shadowApplyTimer, Device);
+		if (GameState.isExterior) 
+			Effects.ShadowsExteriors->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		else 
+			Effects.ShadowsInteriors->Render(Device, RenderTarget, RenderedSurface, 0, true, SourceSurface);
+	}
 
-	Effects.Lens->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	if (Effects.LUT->Settings.PreTonemapping)
-		Effects.LUT->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	{
+		GpuProfileScope gpu(snowAccumulationTimer, Device);
+		Effects.SnowAccumulation->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		GpuProfileScope gpu(aoTimer, Device);
+		Effects.AmbientOcclusion->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		GpuProfileScope gpu(materialEffectsTimer, Device);
+		Effects.WetWorld->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		// Beam march first, into its own half res buffer, so the Flashlight Combine pass can
+		// read it. Control.x already folds the effect toggle, the per view toggle and the
+		// strength together, so this one test gates the whole thing.
+		if (Effects.FlashlightBeam->Constants.Control.x > 0.0f) {
+			RenderEffectToRT(Effects.FlashlightBeam->Textures.VolumetricSurface, Effects.FlashlightBeam, true);
+			Device->SetRenderTarget(0, RenderTarget);
+		}
+		Effects.Flashlight->Render(Device, RenderTarget, RenderedSurface, Effects.Flashlight->selectedPass, true, SourceSurface);
+		Effects.Specular->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		GpuProfileScope gpu(underwaterTimer, Device);
+		Effects.Underwater->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		GpuProfileScope gpu(fogTimer, Device);
+		Effects.VolumetricFog->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		GpuProfileScope gpu(godRaysTimer, Device);
+		Effects.GodRays->Render(Device, RenderTarget, RenderedSurface, 0, true, SourceSurface);
+	}
+
+	{
+		GpuProfileScope gpu(hdrTimer, Device);
+		// calculate average luma for use by shaders
+		if (avglumaRequired) {
+			RenderEffectToRT(Effects.AvgLuma->Textures.AvgLumaSurface, Effects.AvgLuma, NULL);
+			Device->SetRenderTarget(0, RenderTarget); 	// restore device used for effects
+		}
+
+		Effects.Exposure->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		Effects.Bloom->RenderBloomBuffer(RenderTarget);
+	}
+
+	{
+		GpuProfileScope gpu(preColorTimer, Device);
+		Effects.Lens->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		if (Effects.LUT->Settings.PreTonemapping)
+			Effects.LUT->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
 
 	timer.LogTime("ShaderManager::RenderEffectsPreTonemapping");
 }
@@ -851,11 +911,24 @@ void ShaderManager::RenderEffectsPreTonemapping(IDirect3DSurface9* RenderTarget)
 * Renders the effect that have been set to enabled.
 */
 void ShaderManager::RenderEffects(IDirect3DSurface9* RenderTarget) {
+	// F10 toggles the profiler (GpuProfiler.h): per-effect GPU times and a few CPU times, averaged
+	// over 120 frames and written to NewVegasReloaded.log. It is handled before the RenderEffects
+	// check so an effects-off run still logs its frame interval for comparison. This is the last
+	// NVR call of the frame, so the toggle takes effect from the next frame.
+	static CpuTimer frameIntervalTimer("Frame interval (CPU)");
+	if (Player->parentCell && !InterfaceManager->IsActive(Menu::kMenuType_Loading) && Global->OnKeyDown(0x44)) { // DIK_F10
+		GpuTimer::Enabled = !GpuTimer::Enabled;
+		Logger::Log("GPU PROFILE %s (F10), effects %s", GpuTimer::Enabled ? "enabled" : "paused",
+			TheSettingManager->SettingsMain.Main.RenderEffects ? "on" : "OFF");
+	}
+	if (GpuTimer::Enabled) frameIntervalTimer.Tick();
 	if (!TheSettingManager->SettingsMain.Main.RenderEffects) return; // Main toggle
 	if (!Player->parentCell) return;
 	if (GameState.OverlayIsOn) return; // disable all effects during terminal/lockpicking sequences because they bleed through the overlay
 
 	auto timer = TimeLogger();
+	static CpuTimer postChainCpuTimer("Post chain (CPU)");
+	CpuProfileScope postChainCpu(postChainCpuTimer);
 
 	TheRenderManager->UpdateSceneCameraData();
 	TheRenderManager->SetupSceneCamera();
@@ -864,6 +937,17 @@ void ShaderManager::RenderEffects(IDirect3DSurface9* RenderTarget) {
 	NiDX9RenderState* RenderState = TheRenderManager->renderState;
 	IDirect3DSurface9* SourceSurface = TheTextureManager->SourceSurface;
 	IDirect3DSurface9* RenderedSurface = TheTextureManager->RenderedSurface;
+	static GpuTimer postCopyTimer("Post-tonemap copies");
+	static GpuTimer weatherTimer("Weather + legacy bloom");
+	static GpuTimer colorTimer("Coloring + LUT");
+	static GpuTimer dofTimer("Depth of field");
+	static GpuTimer motionBlurTimer("Motion blur");
+	static GpuTimer lensTimer("Lens overlays");
+	static GpuTimer ditherTimer("Dither buster");
+	static GpuTimer smaaTimer("SMAA");
+	static GpuTimer sharpenTimer("Sharpening");
+	static GpuTimer cinemaTimer("Cinema");
+	static GpuTimer imageAdjustTimer("Image adjust + debug");
 
 	Device->SetStreamSource(0, FrameVertex, 0, sizeof(FrameVS));
 	Device->SetFVF(FrameFVF);
@@ -872,40 +956,73 @@ void ShaderManager::RenderEffects(IDirect3DSurface9* RenderTarget) {
 	Device->SetRenderTarget(0, RenderTarget);
 
 	// copy the source render target to both the rendered and source textures (rendered gets updated after every pass, source once per effect)
-	Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_NONE);
-	Device->StretchRect(RenderTarget, NULL, SourceSurface, NULL, D3DTEXF_NONE);
+	{
+		GpuProfileScope gpu(postCopyTimer, Device);
+		Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_NONE);
+		Device->StretchRect(RenderTarget, NULL, SourceSurface, NULL, D3DTEXF_NONE);
+	}
 
-	Effects.Rain->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.Snow->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	{
+		GpuProfileScope gpu(weatherTimer, Device);
+		Effects.Rain->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		Effects.Snow->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
 
-	//Effects.Linearization->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.BloomLegacy->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		//Effects.Linearization->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		Effects.BloomLegacy->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
 
 	// screenspace coloring/blurring effects get rendered last
-	Effects.Coloring->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	if (!Effects.LUT->Settings.PreTonemapping)
-		Effects.LUT->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.DepthOfField->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.MotionBlur->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	{
+		GpuProfileScope gpu(colorTimer, Device);
+		Effects.Coloring->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		if (!Effects.LUT->Settings.PreTonemapping)
+			Effects.LUT->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		GpuProfileScope gpu(dofTimer, Device);
+		Effects.DepthOfField->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		GpuProfileScope gpu(motionBlurTimer, Device);
+		Effects.MotionBlur->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
 
 	// lens effects
-	Effects.BloodLens->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.WaterLens->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.LowHF->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	{
+		GpuProfileScope gpu(lensTimer, Device);
+		Effects.BloodLens->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		Effects.WaterLens->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		Effects.LowHF->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
 
-	Effects.DitherBuster->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
-	Effects.SMAA->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	{
+		GpuProfileScope gpu(ditherTimer, Device);
+		Effects.DitherBuster->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		GpuProfileScope gpu(smaaTimer, Device);
+		Effects.SMAA->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
 
-	Effects.Sharpening->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	{
+		GpuProfileScope gpu(sharpenTimer, Device);
+		Effects.Sharpening->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
 
 	// cinema effect gets rendered very last because of vignetting/letterboxing
-	Effects.Cinema->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	{
+		GpuProfileScope gpu(cinemaTimer, Device);
+		Effects.Cinema->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
 
-	// final adjustments
-	Effects.ImageAdjust->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	{
+		GpuProfileScope gpu(imageAdjustTimer, Device);
+		// final adjustments
+		Effects.ImageAdjust->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
 
-	// debug shader allows to display some of the buffers
-	Effects.Debug->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+		// debug shader allows to display some of the buffers
+		Effects.Debug->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
+	}
 
 	timer.LogTime("ShaderManager::RenderEffects");
 }

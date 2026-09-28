@@ -280,6 +280,9 @@
     <ClInclude Include="..\src\core\ShaderManager.h">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="..\src\core\GpuProfiler.h">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="..\src\core\ShaderRecord.h">
       <Filter>Core</Filter>
     </ClInclude>

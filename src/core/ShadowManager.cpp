@@ -1,3 +1,5 @@
+#include "GpuProfiler.h"
+
 #define ShadowMapFarPlane 32768;
 
 /*
@@ -610,6 +612,15 @@ void ShadowManager::RenderShadowMaps() {
 	if (!Player->parentCell) return;
 
 	auto timer = TimeLogger();
+	// F10 profiler buckets (GpuProfiler.h).
+	static CpuTimer shadowMapsCpuTimer("Shadow maps (CPU)");
+	CpuProfileScope shadowMapsCpu(shadowMapsCpuTimer);
+	static GpuTimer sunCascadesTimer("Sun cascade geometry");
+	static GpuTimer atlasResolveTimer("Shadow atlas resolve");
+	static GpuTimer atlasFilterTimer("Shadow atlas prefilter");
+	static GpuTimer orthoMapTimer("Ortho shadow map");
+	static GpuTimer pointMapsTimer("Point shadow cubemaps");
+	static GpuTimer flashlightMapsTimer("Flashlight shadow maps");
 
 	// prepare some pointers to the device and surfaces
 	IDirect3DDevice9* Device = TheRenderManager->device;
@@ -701,6 +712,10 @@ void ShadowManager::RenderShadowMaps() {
 
 			Device->SetDepthStencilSurface(Shadows->ShadowAtlasDepthSurface);
 
+			{
+			static CpuTimer sunCascadesCpuTimer("Sun cascades (CPU)");
+			CpuProfileScope cpu(sunCascadesCpuTimer);
+			GpuProfileScope gpu(sunCascadesTimer, Device);
 			for (int i = MapNear; i < MapOrtho; i++) {
 				ShadowsExteriorEffect::ShadowMapSettings* ShadowMap = &Shadows->ShadowMaps[i];
 
@@ -724,12 +739,18 @@ void ShadowManager::RenderShadowMaps() {
 				message += std::to_string(i);
 				shadowMapTimer.LogTime(message.c_str());
 			}
+			}
 
 			// Resolve MSAA.
-			if (Shadows->ShadowAtlasSurfaceMSAA)
+			if (Shadows->ShadowAtlasSurfaceMSAA) {
+				GpuProfileScope gpu(atlasResolveTimer, Device);
 				Device->StretchRect(Shadows->ShadowAtlasSurfaceMSAA, NULL, Shadows->ShadowAtlasSurface, NULL, D3DTEXF_NONE);
+			}
 
-			if (Shadows->Settings.ShadowMaps.Prefilter) BlurShadowAtlas();
+			if (Shadows->Settings.ShadowMaps.Prefilter) {
+				GpuProfileScope gpu(atlasFilterTimer, Device);
+				BlurShadowAtlas();
+			}
 
 			if (Shadows->Settings.ShadowMaps.Mipmaps)
 				Shadows->ShadowAtlasTexture->GenerateMipSubLevels();
@@ -742,6 +763,7 @@ void ShadowManager::RenderShadowMaps() {
 			ShadowsExteriorEffect::ShadowMapSettings* ShadowMap = &Shadows->ShadowMaps[MapOrtho];
 
 			if (!Shadows->Settings.OrthoMap.LimitFrequency || !((FrameCounter + 2) % 4)) {
+				GpuProfileScope gpu(orthoMapTimer, Device);
 				Device->SetRenderTarget(0, Shadows->ShadowMapOrthoSurface);
 				Device->SetDepthStencilSurface(Shadows->ShadowMapOrthoDepthSurface);
 
@@ -782,6 +804,7 @@ void ShadowManager::RenderShadowMaps() {
 
 	auto shadowMapTimer = TimeLogger();
 	if ((isExterior && usePointLights) || (!isExterior && InteriorEnabled)) {
+		GpuProfileScope gpu(pointMapsTimer, Device);
 		// render the cubemaps for each light
 		for (int i = 0; i < ShadowsInteriors->LightPoints; i++) {
 
@@ -796,7 +819,8 @@ void ShadowManager::RenderShadowMaps() {
 
 	if (TheShaderManager->Effects.Flashlight->Enabled && TheShaderManager->Effects.Flashlight->spotLightActive && TheShaderManager->Effects.Flashlight->Settings.renderShadows) {
 		// render shadow maps for spotlights
-		
+		GpuProfileScope gpu(flashlightMapsTimer, Device);
+
 		for (int i = 0; i < SpotLightsMax; i++) {
 			if (!SpotLights[i] || SpotLights[i]->Spec.r == 0) continue; //bypass lights with no radius
 
