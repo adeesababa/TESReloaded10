@@ -1,8 +1,60 @@
 #define ShadowMapFarPlane 32768;
+#include "ShadowFaceCull.h"
+
+static bool TouchesShadowFace(NiAVObject* object, const NiPoint3* light,
+                              const D3DXVECTOR3& direction) {
+	// Animated/deformed geometry may exceed the engine's current CPU bound.
+	NiGeometry* geometry = object->IsGeometry() ? static_cast<NiGeometry*>(object) : nullptr;
+	if (geometry && geometry->skinInstance) return true;
+	NiBound* bound = object->m_kWorldBound;
+	if (!bound) return true;
+	return ShadowSphereTouchesFace(bound->Center.x - light->x,
+		bound->Center.y - light->y, bound->Center.z - light->z, bound->Radius,
+		direction.x, direction.y, direction.z);
+}
 
 /*
 * Initializes the Shadow Manager by grabbing the relevant settings and shaders, and setting up map sizes.
 */
+
+// Refresh period per cascade. This used to require MSAA for the middle and far cascades: the
+// atlas blur once ran on every cascade every frame, so without an MSAA surface to re-resolve
+// from, a cached cascade would have been re-blurred each frame. Resolve and blur now run only on
+// cascades updated that frame (BlurShadowAtlas mask), so cached cascades stay untouched either way.
+constexpr unsigned SunCascadeUpdatePeriod(int cascade, bool limitFrequency) {
+	if (!limitFrequency) return 1;
+	if (cascade == ShadowManager::MapMiddle) return 4;
+	if (cascade == ShadowManager::MapFar || cascade == ShadowManager::MapLod) return 8;
+	return 1;
+}
+
+static_assert(SunCascadeUpdatePeriod(ShadowManager::MapNear, true) == 1 &&
+	SunCascadeUpdatePeriod(ShadowManager::MapMiddle, true) == 4 &&
+	SunCascadeUpdatePeriod(ShadowManager::MapFar, true) == 8 &&
+	SunCascadeUpdatePeriod(ShadowManager::MapLod, true) == 8 &&
+	SunCascadeUpdatePeriod(ShadowManager::MapFar, false) == 1,
+	"Sun cascade update schedule changed unexpectedly");
+
+// Frame offset within each cascade's period, so the infrequent cascades never refresh on the
+// same frame: over the 8-frame cycle, 0 near only, 1/5 middle, 2/6 ortho map, 3 far, 7 LOD.
+// Refresh rates are unchanged; this only removes the frame where all four used to render.
+constexpr unsigned SunCascadeUpdatePhase(int cascade) {
+	if (cascade == ShadowManager::MapMiddle) return 1;
+	if (cascade == ShadowManager::MapFar) return 3;
+	if (cascade == ShadowManager::MapLod) return 7;
+	return 0;
+}
+
+constexpr bool SunCascadeUpdatesOnFrame(int cascade, unsigned frame, unsigned period) {
+	return frame % period == SunCascadeUpdatePhase(cascade) % period;
+}
+
+static_assert(SunCascadeUpdatesOnFrame(ShadowManager::MapNear, 5, 1) &&
+	SunCascadeUpdatesOnFrame(ShadowManager::MapMiddle, 5, 4) && !SunCascadeUpdatesOnFrame(ShadowManager::MapMiddle, 0, 4) &&
+	SunCascadeUpdatesOnFrame(ShadowManager::MapFar, 3, 8) && SunCascadeUpdatesOnFrame(ShadowManager::MapLod, 7, 8) &&
+	SunCascadeUpdatesOnFrame(ShadowManager::MapFar, 0, 1),
+	"Sun cascade stagger changed unexpectedly");
+
 void ShadowManager::Initialize() {
 	
 	Logger::Log("Starting the shadows manager...");
@@ -459,6 +511,10 @@ void ShadowManager::RenderShadowCubeMap(ShadowSceneLight** Lights, UInt32 LightI
 				if (!shaderProp)
 					continue;
 
+				// SpeedTree shaders move vertices beyond their static bounds.
+				if (shaderProp->IsLightingProperty() && !TouchesShadowFace(geo, LightPos, CameraDirection))
+					continue;
+
 				// Skip refraction and fire refraction.
 				if (!CheckShaderFlags(geo))
 					continue;
@@ -701,35 +757,57 @@ void ShadowManager::RenderShadowMaps() {
 
 			Device->SetDepthStencilSurface(Shadows->ShadowAtlasDepthSurface);
 
+			unsigned updatedCascades = 0;
 			for (int i = MapNear; i < MapOrtho; i++) {
 				ShadowsExteriorEffect::ShadowMapSettings* ShadowMap = &Shadows->ShadowMaps[i];
+				const unsigned updatePeriod = SunCascadeUpdatePeriod(i, Shadows->Settings.ShadowMaps.LimitFrequency);
 
-				if (!Shadows->Settings.ShadowMaps.LimitFrequency || i != MapLod || !(FrameCounter % 4)) {
+				if (ForceAllCascades || SunCascadeUpdatesOnFrame(i, FrameCounter, updatePeriod)) {
+					updatedCascades |= 1u << i;
 					Shadows->Constants.ShadowViewProj = Shadows->GetCascadeViewProj(ShadowMap, &SunDir);
 					RenderShadowMap(ShadowMap, &Shadows->Constants.ShadowViewProj);
 				}
 				else {
-					// We need to update the shadowprojmatrix of MapLod by the camera translation between frames to avoid jumps in the shadows.
+					// Keep cached cascades locked to camera translation between geometry refreshes.
 					D3DXVECTOR3 newCameraTranslation = WorldSceneGraph->camera->m_worldTransform.pos.toD3DXVEC3();
 					D3DXVECTOR3 difference = newCameraTranslation - ShadowMap->CameraTranslation;
 					D3DXMATRIX translationMatrix;
 					D3DXMatrixTranslation(&translationMatrix, difference.x, difference.y, difference.z);
 					ShadowMap->ShadowCameraToLight = translationMatrix * ShadowMap->ShadowCameraToLight;
 					ShadowMap->CameraTranslation = newCameraTranslation;
-					
-					Shadows->Constants.ShadowBlur.y = Shadows->ShadowAtlasSurfaceMSAA ? 1.0f : 0.0f; // Disable blur for last cascade if MSAA is off.
+
 				}
 
 				std::string message = "ShadowManager::RenderShadowMap ";
 				message += std::to_string(i);
 				shadowMapTimer.LogTime(message.c_str());
 			}
+			ForceAllCascades = false;
 
 			// Resolve MSAA.
-			if (Shadows->ShadowAtlasSurfaceMSAA)
-				Device->StretchRect(Shadows->ShadowAtlasSurfaceMSAA, NULL, Shadows->ShadowAtlasSurface, NULL, D3DTEXF_NONE);
+			if (Shadows->ShadowAtlasSurfaceMSAA) {
+				bool partialResolveFailed = false;
+				for (int i = MapNear; i < MapOrtho; ++i) {
+					if (!(updatedCascades & (1u << i))) continue;
+					const D3DVIEWPORT9& viewport = Shadows->ShadowMaps[i].ShadowMapViewPort;
+					RECT region = {(LONG)viewport.X, (LONG)viewport.Y,
+						(LONG)(viewport.X + viewport.Width), (LONG)(viewport.Y + viewport.Height)};
+					if (FAILED(Device->StretchRect(Shadows->ShadowAtlasSurfaceMSAA, &region,
+						Shadows->ShadowAtlasSurface, &region, D3DTEXF_NONE))) {
+						partialResolveFailed = true;
+						break;
+					}
+				}
+				if (partialResolveFailed) {
+					Device->StretchRect(Shadows->ShadowAtlasSurfaceMSAA, NULL,
+						Shadows->ShadowAtlasSurface, NULL, D3DTEXF_NONE);
+					updatedCascades = (1u << MapOrtho) - 1;
+				}
+			}
 
-			if (Shadows->Settings.ShadowMaps.Prefilter) BlurShadowAtlas();
+			if (Shadows->Settings.ShadowMaps.Prefilter) {
+				BlurShadowAtlas(updatedCascades);
+			}
 
 			if (Shadows->Settings.ShadowMaps.Mipmaps)
 				Shadows->ShadowAtlasTexture->GenerateMipSubLevels();
@@ -842,7 +920,7 @@ void ShadowManager::RenderShadowMaps() {
 
 	Device->EndScene();
 
-	FrameCounter = (FrameCounter + 1) % 4;
+	FrameCounter = (FrameCounter + 1) % 8;
 	shadowMapsRenderTime = timer.LogTime("ShadowManager::RenderShadowMaps");
 }
 
@@ -888,7 +966,7 @@ void ShadowManager::ClearShadowCascade(D3DVIEWPORT9* ViewPort, D3DXVECTOR4* Clea
 /*
 * Filters the Shadow Map of given index using a 2 pass gaussian blur
 */
-void ShadowManager::BlurShadowAtlas() {
+void ShadowManager::BlurShadowAtlas(unsigned cascadeMask) {
 	ShadowsExteriorEffect* Shadows = TheShaderManager->Effects.ShadowsExteriors;
 	
 	IDirect3DDevice9* Device = TheRenderManager->device;
@@ -901,7 +979,12 @@ void ShadowManager::BlurShadowAtlas() {
 	// D3D9 and a read/write feedback loop on Vulkan under DXVK. This Gaussian is the only
 	// filtering the shadow maps get (the cascade lookup is a single tap), so anything that
 	// compromises it shows up directly as hard, unfiltered texels along every shadow edge.
-	if (!Shadows->ShadowAtlasBlurTexture || !Shadows->ShadowAtlasBlurSurface) return;
+	if (!cascadeMask || !Shadows->ShadowAtlasBlurTexture || !Shadows->ShadowAtlasBlurSurface) return;
+
+	DWORD oldScissorEnabled = FALSE;
+	RECT oldScissor = {};
+	if (FAILED(Device->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissorEnabled)) ||
+		FAILED(Device->GetScissorRect(&oldScissor))) return;
 
     Device->SetDepthStencilSurface(NULL);
     RenderState->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE, RenderStateArgs);
@@ -932,10 +1015,20 @@ void ShadowManager::BlurShadowAtlas() {
 		// set blur direction shader constants
 		ShadowMapBlurPixel->SetShaderConstantF(1, &Blur[i], 1);
 
-		Device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2); // draw call to execute the shader
+		RenderState->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE, RenderStateArgs);
+		for (int cascade = MapNear; cascade < MapOrtho; ++cascade) {
+			if (!(cascadeMask & (1u << cascade))) continue;
+			const D3DVIEWPORT9& viewport = Shadows->ShadowMaps[cascade].ShadowMapViewPort;
+			RECT region = {(LONG)viewport.X, (LONG)viewport.Y,
+				(LONG)(viewport.X + viewport.Width), (LONG)(viewport.Y + viewport.Height)};
+			Device->SetScissorRect(&region);
+			Device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+		}
 	}
 
 	RenderState->SetTexture(0, nullptr);
+	Device->SetScissorRect(&oldScissor);
+	RenderState->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissorEnabled, RenderStateArgs);
 	RenderState->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE, RenderStateArgs);
     RenderState->SetRenderState(D3DRS_ZWRITEENABLE, D3DZB_TRUE, RenderStateArgs);
 }
