@@ -20,6 +20,7 @@ public:
 
 	bool 					IsLoaded();
 	bool					Enabled;
+	bool					usesSourceBuffer = true; // false when the effect declares no TESR_SourceBuffer sampler
 	float					renderTime;
 	float					constantUpdateTime;
 

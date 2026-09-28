@@ -221,10 +221,12 @@ void EffectRecord::CreateCT(ID3DXBuffer* ShaderSource, ID3DXConstantTable* Const
 	UInt32 TextureIndex = 0;
 
 	Effect->GetDesc(&ConstantTableDesc);
+	usesSourceBuffer = false;
 	for (UINT c = 0; c < ConstantTableDesc.Parameters; c++) {
 		Handle = Effect->GetParameter(NULL, c);
 		Effect->GetParameterDesc(Handle, &ConstantDesc);
 		if (memcmp(ConstantDesc.Name, "TESR_", 5)) continue;
+		if (!strcmp(ConstantDesc.Name, "TESR_SourceBuffer")) usesSourceBuffer = true;
 		if ((ConstantDesc.Class == D3DXPC_VECTOR || ConstantDesc.Class == D3DXPC_MATRIX_ROWS)) FloatShaderValuesCount += 1;
 		if (ConstantDesc.Class == D3DXPC_OBJECT && ConstantDesc.Type >= D3DXPT_SAMPLER && ConstantDesc.Type <= D3DXPT_SAMPLERCUBE) TextureShaderValuesCount += 1;
 	}
@@ -353,7 +355,10 @@ void EffectRecord::Render(IDirect3DDevice9* Device, IDirect3DSurface9* RenderTar
 	}
 
 	auto timer = TimeLogger();
-	if (SourceBuffer) Device->StretchRect(RenderTarget, NULL, SourceBuffer, NULL, D3DTEXF_LINEAR);
+	// Effects that never sample TESR_SourceBuffer do not need the full-resolution copy. Every
+	// effect that does sample it declares the sampler and so still refreshes it here itself.
+	if (SourceBuffer && usesSourceBuffer && SourceBuffer != RenderTarget)
+		Device->StretchRect(RenderTarget, NULL, SourceBuffer, NULL, D3DTEXF_LINEAR);
 
 	try {
 		D3DXHANDLE technique = Effect->GetTechnique(techniqueIndex);
@@ -366,7 +371,7 @@ void EffectRecord::Render(IDirect3DDevice9* Device, IDirect3DSurface9* RenderTar
 			Effect->BeginPass(p);
 			Device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 			Effect->EndPass();
-			if (RenderedSurface) Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_LINEAR); // copy the result from the pass into the texture
+			if (RenderedSurface && RenderedSurface != RenderTarget) Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_LINEAR); // copy the result from the pass into the texture
 		}
 		Effect->End();
 	}

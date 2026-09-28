@@ -805,9 +805,9 @@ void ShaderManager::RenderEffectsPreTonemapping(IDirect3DSurface9* RenderTarget)
 
 	Device->SetRenderTarget(0, RenderTarget);
 
-	// copy the source render target to both the rendered and source textures (rendered gets updated after every pass, source once per effect)
+	// Seed the rendered texture, which every effect keeps equal to the render target. TESR_SourceBuffer
+	// is refreshed by each effect that actually samples it (EffectRecord::usesSourceBuffer).
 	Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_NONE);
-	Device->StretchRect(RenderTarget, NULL, SourceSurface, NULL, D3DTEXF_NONE);
 
 	if (GameState.isExterior) 
 		Effects.ShadowsExteriors->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
@@ -871,9 +871,9 @@ void ShaderManager::RenderEffects(IDirect3DSurface9* RenderTarget) {
 	// prepare device for effects
 	Device->SetRenderTarget(0, RenderTarget);
 
-	// copy the source render target to both the rendered and source textures (rendered gets updated after every pass, source once per effect)
+	// Seed the rendered texture, which every effect keeps equal to the render target. TESR_SourceBuffer
+	// is refreshed by each effect that actually samples it (EffectRecord::usesSourceBuffer).
 	Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_NONE);
-	Device->StretchRect(RenderTarget, NULL, SourceSurface, NULL, D3DTEXF_NONE);
 
 	Effects.Rain->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
 	Effects.Snow->Render(Device, RenderTarget, RenderedSurface, 0, false, SourceSurface);
