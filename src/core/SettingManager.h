@@ -28,6 +28,7 @@ struct SettingsMainStruct {
         bool    FXAA; // [Main.Main.ReducedQuality] FXAA (lean FXAA pass after SMAA)
         int     PointShadowInterval; // [Main.Main.ReducedQuality] PointShadowInterval (redraw each point-light shadow cubemap every N frames, 1-4)
         bool    CheapReflections; // [Main.Main.ReducedQuality] CheapReflections (water reflection map drawn without sun shadows and terrain parallax)
+        bool    StaggeredSunShadows; // [Main.Main.ReducedQuality] StaggeredSunShadows (middle sun-shadow cascade every 4th frame, far/Lod every 8th)
         int     NearCascadeInterval; // [Main.Main.ReducedQuality] NearCascadeInterval (redraw the near sun-shadow cascade every N frames, 1-2)
         bool    PresetManagerEnabled; // master on/off for automatic per-location preset resolution -- docs/preset-manager-design.md
 		UInt8	AnisotropicFilter;

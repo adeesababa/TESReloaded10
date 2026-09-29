@@ -438,6 +438,7 @@ void SettingManager::LoadSettings() {
 		SettingsMain.Main.PointShadowInterval = max(1, min(interval, 4));
 	}
 	SettingsMain.Main.CheapReflections = boolSetting(reducedQuality, "CheapReflections", false);
+	SettingsMain.Main.StaggeredSunShadows = boolSetting(reducedQuality, "StaggeredSunShadows", false);
 	{
 		Configuration::ConfigNode node;
 		const int interval = Config.FillNode(&node, reducedQuality, "NearCascadeInterval") ? node.IntValue : 1;
