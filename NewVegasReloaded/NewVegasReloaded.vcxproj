@@ -162,6 +162,7 @@
     <ClCompile Include="..\src\effects\POM.cpp" />
     <ClCompile Include="..\src\effects\Rain.cpp" />
     <ClCompile Include="..\src\effects\SMAA.cpp" />
+    <ClCompile Include="..\src\effects\FXAA.cpp" />
     <ClCompile Include="..\src\effects\ShadowsExterior.cpp" />
     <ClCompile Include="..\src\effects\ShadowsInteriors.cpp" />
     <ClCompile Include="..\src\effects\Sharpening.cpp" />
@@ -226,6 +227,7 @@
     <ClInclude Include="..\src\core\FrameRateManager.h" />
     <ClInclude Include="..\src\core\GameEventManager.h" />
     <ClInclude Include="..\src\core\GameMenuManager.h" />
+    <ClInclude Include="..\src\core\GpuProfiler.h" />
     <ClInclude Include="..\src\core\ImGuiManager.h" />
     <ClInclude Include="..\src\core\Hooks\FormsCommon.h" />
     <ClInclude Include="..\src\core\Hooks\GameCommon.h" />
@@ -249,6 +251,7 @@
     <ClInclude Include="..\src\effects\DitherBuster.h" />
     <ClInclude Include="..\src\effects\Coloring.h" />
     <ClInclude Include="..\src\effects\LUT.h" />
+    <ClInclude Include="..\src\effects\LUTIdentity.h" />
     <ClInclude Include="..\src\effects\CombineDepth.h" />
     <ClInclude Include="..\src\effects\Debug.h" />
     <ClInclude Include="..\src\effects\DepthOfField.h" />
@@ -269,6 +272,7 @@
     <ClInclude Include="..\src\effects\POM.h" />
     <ClInclude Include="..\src\effects\Rain.h" />
     <ClInclude Include="..\src\effects\SMAA.h" />
+    <ClInclude Include="..\src\effects\FXAA.h" />
     <ClInclude Include="..\src\effects\ShadowsExterior.h" />
     <ClInclude Include="..\src\effects\ShadowsInteriors.h" />
     <ClInclude Include="..\src\effects\Sharpening.h" />
