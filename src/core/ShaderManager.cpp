@@ -77,12 +77,14 @@ void ShaderManager::Initialize() {
 	TheShaderManager->RegisterEffect<SnowEffect>(&TheShaderManager->Effects.Snow);
 	TheShaderManager->RegisterEffect<SnowAccumulationEffect>(&TheShaderManager->Effects.SnowAccumulation);
 	TheShaderManager->RegisterEffect<UnderwaterEffect>(&TheShaderManager->Effects.Underwater);
+	TheShaderManager->RegisterEffect<VolumetricLightEffect>(&TheShaderManager->Effects.VolumetricLight);
 	TheShaderManager->RegisterEffect<VolumetricFogEffect>(&TheShaderManager->Effects.VolumetricFog);
 	TheShaderManager->RegisterEffect<WaterLensEffect>(&TheShaderManager->Effects.WaterLens);
 	TheShaderManager->RegisterEffect<WetWorldEffect>(&TheShaderManager->Effects.WetWorld);
 	TheShaderManager->RegisterEffect<DitherBusterEffect>(&TheShaderManager->Effects.DitherBuster);
 	TheShaderManager->RegisterEffect<SMAAEffect>(&TheShaderManager->Effects.SMAA);
 	TheShaderManager->RegisterEffect<FXAAEffect>(&TheShaderManager->Effects.FXAA);
+	TheShaderManager->RegisterEffect<TAAEffect>(&TheShaderManager->Effects.TAA);
 
 	TheShaderManager->RegisterShaderCollection<TonemappingShaders>(&TheShaderManager->Shaders.Tonemapping);
 	TheShaderManager->RegisterShaderCollection<POMShaders>(&TheShaderManager->Shaders.POM);
@@ -195,6 +197,19 @@ template <typename T> void ShaderManager::RegisterShaderCollection(T** Pointer)
  */
 void ShaderManager::ClearShaderSamplers(const char* TextureName, size_t Length)
 {
+	// Effects as well as game shaders. This used to walk ShaderNames alone, so effects had to be
+	// cleared individually by name at each call site -- and only SunShadows ever was. Any other
+	// effect sampling a recreated texture kept its dangling pointer, which the device still
+	// references, so it silently went on reading whatever was last rendered into the dead one.
+	// VolumetricLight samples TESR_ShadowAtlas and hit exactly that: after any shadow setting
+	// change its shafts were carved by a frozen copy of the atlas and no longer matched the
+	// scene. Covering every effect here fixes it for all of them rather than adding one more
+	// name to a list that has to be maintained by hand.
+	for (const auto& Entry : EffectsNames) {
+		EffectRecord* Effect = Entry.second ? *Entry.second : nullptr;
+		if (Effect) Effect->ClearSampler(TextureName, Length);
+	}
+
 	for (const auto& Entry : ShaderNames) {
 		ShaderCollection* Collection = Entry.second ? *Entry.second : nullptr;
 		if (!Collection) continue;
@@ -811,6 +826,7 @@ void ShaderManager::RenderEffectsPreTonemapping(IDirect3DSurface9* RenderTarget)
 	static GpuTimer aoTimer("Ambient occlusion");
 	static GpuTimer snowAccumulationTimer("Snow accumulation");
 	static GpuTimer materialEffectsTimer("Wet + light materials");
+	static GpuTimer volumetricLightTimer("Volumetric light");
 	static GpuTimer fogTimer("Volumetric fog");
 	static GpuTimer godRaysTimer("God rays");
 	static GpuTimer hdrTimer("Luma + exposure + bloom");
@@ -893,7 +909,8 @@ void ShaderManager::RenderEffectsPreTonemapping(IDirect3DSurface9* RenderTarget)
 	const bool shadowApplies = GameState.isExterior && wouldRender(Effects.ShadowsExteriors);
 	const bool aoApplies = wouldRender(AO);
 	const bool effectsBetween = wouldRender(Effects.SnowAccumulation) || wouldRender(Effects.WetWorld) ||
-		wouldRender(Effects.Flashlight) || wouldRender(Effects.Specular) || wouldRender(Effects.Underwater);
+		wouldRender(Effects.Flashlight) || wouldRender(Effects.Specular) || wouldRender(Effects.Underwater) ||
+		wouldRender(Effects.VolumetricLight);
 	bool composite = (shadowApplies || aoApplies) && !effectsBetween &&
 		Fog->CanComposite(aoApplies ? AO->NextResultSurface() : nullptr);
 	AO->deferredReady = false;
@@ -939,6 +956,20 @@ void ShaderManager::RenderEffectsPreTonemapping(IDirect3DSurface9* RenderTarget)
 		Effects.Flashlight->Render(Device, RenderTarget, TheTextureManager->RenderedSurface, Effects.Flashlight->selectedPass, true, SourceSurface);
 		Effects.Specular->Render(Device, RenderTarget, TheTextureManager->RenderedSurface, 0, false, SourceSurface);
 		Effects.Underwater->Render(Device, RenderTarget, TheTextureManager->RenderedSurface, 0, false, SourceSurface);
+	}
+	{
+		// VolumetricLight (upstream #78): the march into its own half-res buffer (technique 0) and its temporal
+		// filter, then the composite onto the scene (technique 1), just before fog as upstream orders it. The march
+		// does not read the scene, so running it here instead of before the flashlight gives the same result. The
+		// guard is upstream's: RenderEffectToRT switches the target before Render can test Enabled/ShouldRender.
+		GpuProfileScope gpu(volumetricLightTimer, Device);
+		VolumetricLightEffect* light = Effects.VolumetricLight;
+		if (light->Textures.VolumetricSurface && light->Enabled && light->ShouldRender()) {
+			RenderEffectToRT(light->Textures.VolumetricSurface, light, true);
+			light->RenderTemporal(Device);
+			Device->SetRenderTarget(0, RenderTarget);
+		}
+		light->Render(Device, RenderTarget, TheTextureManager->RenderedSurface, 1, false, SourceSurface);
 	}
 	{
 		GpuProfileScope gpu(fogTimer, Device);
@@ -1037,6 +1068,7 @@ void ShaderManager::RenderEffects(IDirect3DSurface9* RenderTarget) {
 	IDirect3DSurface9* SourceSurface = TheTextureManager->SourceSurface;
 	IDirect3DSurface9* RenderedSurface = TheTextureManager->RenderedSurface;
 	static GpuTimer postCopyTimer("Post-tonemap copies");
+	static GpuTimer taaTimer("TAA");
 	static GpuTimer weatherTimer("Weather + legacy bloom");
 	static GpuTimer colorTimer("Coloring + LUT");
 	static GpuTimer dofTimer("Depth of field");
@@ -1075,6 +1107,15 @@ void ShaderManager::RenderEffects(IDirect3DSurface9* RenderTarget) {
 		for (EffectRecord* effect : order)
 			if (effect && effect->Enabled && effect->Effect && effect->ShouldRender()) last = effect;
 		Chain.SetFinalEffect(last);
+	}
+
+	// TAA (upstream #78) first: after tonemapping, so it resolves LDR values that cannot ghost as HDR highlights
+	// do, and ahead of everything below. Rain and snow are particles with no depth of their own to reproject by,
+	// DoF and motion blur want the stable image as input, and the lens effects and cinema overlay are fixed to
+	// the screen. TAAEffect::Render manages its own targets and syncs the frame chain first.
+	{
+		GpuProfileScope gpu(taaTimer, Device);
+		Effects.TAA->Render(Device, RenderTarget, TheTextureManager->RenderedSurface, 0, false, SourceSurface);
 	}
 
 	{

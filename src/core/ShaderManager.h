@@ -169,12 +169,14 @@ public:
 		PointShadows2Effect*	PointShadows2;
 		SunShadowsEffect*		SunShadows;
 		UnderwaterEffect*		Underwater;
+		VolumetricLightEffect*	VolumetricLight;
 		VolumetricFogEffect*	VolumetricFog;
 		WaterLensEffect*		WaterLens;
 		WetWorldEffect*			WetWorld;
 		DitherBusterEffect*		DitherBuster;
 		SMAAEffect*				SMAA;
 		FXAAEffect*				FXAA;
+		TAAEffect*				TAA;
 	};
 
 	struct ShadersStruct{
